@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  DataVision Pipeline - A secure, validated, and scalable serverless CSV processing pipeline.
+
+Globals:
+  Function:
+    Timeout: 10
+
+Resources:
+
+  ### SQS Queue (moved before S3 bucket) ###
+  RawCsvQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-raw-csv-queue"
+
+
+  RawCsvQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref RawCsvQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service: "s3.amazonaws.com"
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt RawCsvQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-bembe-raw-data"
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  ### S3 Buckets ###
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - RawCsvQueuePolicy
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bembe-raw-data"
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt RawCsvQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: ".csv"
+
+  CleanDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bembe-clean-data"
+
+  ### IAM Role for Lambda ###
+  RawCsvProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${RawDataBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "arn:aws:s3:::${CleanDataBucket}/*"
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt RawCsvQueue.Arn
+              - Effect: Allow
+                Action:
+                  - glue:StartJobRun
+                Resource: !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${MyGlueJob}"
+
+  ### Lambda Function ###
+  RawCsvProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: rawCsvProcessor.handler
+      Runtime: nodejs22.x
+      Role: !GetAtt RawCsvProcessorFunctionRole.Arn
+      Environment:
+        Variables:
+          CLEAN_BUCKET: !Ref CleanDataBucket
+          GLUE_JOB_NAME: "transformCsvJob"
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RawCsvQueue.Arn
+            BatchSize: 1
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - rawCsvProcessor.ts
+        Bundle: true
+        Minify: false
+        Target: 'es2020'
+        Sourcemap: false
+
+
+
+
+
+
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bembe-glue-scripts"
+  AnalyticsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-bembe-analytics-data"
+
+  ### Glue IAM Role ###
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+  ### AWS Glue Job ###
+  MyGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: transformCsvJob
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/transform_csv.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        --TempDir: !Sub "s3://${GlueScriptsBucket}/temp/"
+        --job-language: python
+        --input_path: !Sub "s3://${CleanDataBucket}/cleaned/"
+        --output_path: !Sub "s3://${AnalyticsDataBucket}/final/"
+      GlueVersion: "3.0"
+      NumberOfWorkers: 2
+      WorkerType: Standard
+
+  ### Glue Database ###
+  DataVisionDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: datavision_catalog_db
+
+  ### Glue Crawler Role ###
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  ### Glue Crawler ###
+  AnalyticsDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: analytics-data-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref DataVisionDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${AnalyticsDataBucket}/final/"
+      TablePrefix: analytics_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  GlueJobSuccessRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: GlueJobSuccessRule
+      EventPattern:
+        source:
+          - "aws.glue"
+        detail-type:
+          - "Glue Job State Change"
+        detail:
+          jobName:
+            - "transformCsvJob"
+          state:
+            - "SUCCEEDED"
+      Targets:
+        - Arn: !GetAtt RunCrawlerLambda.Arn
+          Id: "RunCrawlerLambda"
+  
+  
+  RunCrawlerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: triggerCrawler.handler
+      CodeUri: src/
+      Policies:
+        - AWSGlueConsoleFullAccess  
+      Environment:
+        Variables:
+          CRAWLER_NAME: !Ref AnalyticsDataCrawler 
+      Events:
+        GlueJobSuccess:
+          Type: CloudWatchEvent
+          Properties:
+            Pattern:
+              source:
+                - "aws.glue"
+              detail-type:
+                - "Glue Job State Change"
+              detail:
+                jobName:
+                  - "transformCsvJob"
+                state:
+                  - "SUCCEEDED"
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - triggerCrawler.ts
+        Bundle: true
+        Minify: false
+        Target: es2020
+        Sourcemap: false
+
+
+
+
+Outputs:
+  RawDataBucket:
+    Value: !Ref RawDataBucket
+    Description: "S3 Bucket for raw CSV uploads"
+
+  CleanDataBucket:
+    Value: !Ref CleanDataBucket
+    Description: "S3 Bucket for processed CSV files"
+
+  RawCsvQueue:
+    Value: !Ref RawCsvQueue
+    Description: "SQS Queue for CSV processing"
+
+  LambdaFunction:
+    Value: !Ref RawCsvProcessorFunction
+    Description: "Function triggered by SQS when object is put into S3"

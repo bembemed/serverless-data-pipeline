@@ -1,0 +1,23 @@
+{
+  "name": "datavision-pipeline",
+  "version": "1.0.0",
+  "description": "This project contains source code and supporting files for a serverless application that you can deploy with the SAM CLI. It includes the following files and folders.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@aws-sdk/client-athena": "^3.830.0",
+    "@aws-sdk/client-glue": "^3.834.0",
+    "@aws-sdk/client-s3": "^3.832.0",
+    "@types/aws-lambda": "^8.10.150",
+    "@types/node": "^24.0.3",
+    "csv-parser": "^3.2.0",
+    "zod": "^3.25.67"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "esbuild": "^0.25.5"
+  }
+}

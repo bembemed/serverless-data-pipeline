@@ -1,0 +1,277 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  DataVision Pipeline - A secure, validated, and scalable serverless CSV processing pipeline with Athena integration.
+
+Globals:
+  Function:
+    Timeout: 10
+
+Resources:
+
+  ### SQS Queue for decoupling ###
+  RawCsvQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-raw-csv-queue"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "No VPC is required for this use case"
+    DependsOn: RawDataBucket
+
+  RawCsvQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref RawCsvQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt RawCsvQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:s3:::${AWS::StackName}-raw-data
+
+
+  ### S3 Notification to SQS ###
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-raw-data"
+
+
+
+  CleanDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-clean-data"
+
+  AnalyticsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-analytics-data"
+
+  GlueScriptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-glue-scripts"
+
+
+
+  ### Lambda Function to Clean CSV ###
+  RawCsvProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: rawCsvProcessor.handler
+      Runtime: nodejs22.x
+      Environment:
+        Variables:
+          CLEAN_BUCKET: !Ref CleanDataBucket
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RawCsvQueue.Arn
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:GetObject
+            Resource: !Sub arn:aws:s3:::${AWS::StackName}-raw-data/*
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource: !Sub arn:aws:s3:::${AWS::StackName}-clean-data/*
+        - Statement:
+            Effect: Allow
+            Action:
+              - glue:StartJobRun
+            Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/transformCsvJob
+
+  ### Glue IAM Role ###
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  ### AWS Glue Job ###
+  MyGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: transformCsvJob
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub "s3://${GlueScriptsBucket}/transform_csv.py"
+        PythonVersion: "3"
+      DefaultArguments:
+        --TempDir: !Sub "s3://${GlueScriptsBucket}/temp/"
+        --job-language: python
+        --input_path: !Sub "s3://${CleanDataBucket}/cleaned/"
+        --output_path: !Sub "s3://${AnalyticsDataBucket}/final/"
+      GlueVersion: "3.0"
+      NumberOfWorkers: 2
+      WorkerType: Standard
+
+  DataCatalogDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: datavision_catalog_db
+
+  ProcessedDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: ProcessedDataCrawler
+      Role: !GetAtt GlueJobRole.Arn
+      DatabaseName: !Ref DataCatalogDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${AnalyticsDataBucket}/final/"
+      TablePrefix: processed_
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      RecrawlPolicy:
+        RecrawlBehavior: CRAWL_EVERYTHING
+
+  TriggerCrawlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: triggerCrawler.handler
+      Runtime: nodejs22.x
+      Timeout: 10
+      Environment:
+        Variables:
+          CRAWLER_NAME: ProcessedDataCrawler
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - glue:StartCrawler
+            Resource: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:crawler/ProcessedDataCrawler
+      Events:
+        GlueJobCompletion:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - "aws.glue"
+              detail-type:
+                - "Glue Job State Change"
+              detail:
+                jobName:
+                  - "transformCsvJob"
+                state:
+                  - "SUCCEEDED"
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: datavision-wg
+      Description: Athena workgroup for DataVision analytics
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AnalyticsDataBucket}/athena-results/"
+
+  RunAthenaQueryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: runAthenaQuery.handler
+      Runtime: nodejs22.x
+      Timeout: 30
+      Environment:
+        Variables:
+          WORKGROUP: datavision-wg
+          DATABASE: datavision_catalog_db
+          OUTPUT: !Sub "s3://${AnalyticsDataBucket}/athena-results/"
+          QUERY: |
+            SELECT name, AVG(score) as avg_score
+            FROM processed_final
+            GROUP BY name
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - athena:StartQueryExecution
+              - athena:GetQueryExecution
+              - athena:GetQueryResults
+            Resource: !Sub arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/datavision-wg
+
+  S3NotificationCustomResourceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-S3NotificationConfigurer"
+      Runtime: nodejs22.x
+      Handler: s3-notification-handler.handler
+      CodeUri: src/
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action:
+              - s3:PutBucketNotification
+            Resource: !Sub arn:aws:s3:::${AWS::StackName}-raw-data
+        - Statement:
+            Effect: Allow
+            Action:
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt RawCsvQueue.Arn
+
+  S3NotificationCustomResource:
+    Type: Custom::S3Notification
+    Properties:
+      ServiceToken: !GetAtt S3NotificationCustomResourceFunction.Arn
+      BucketName: !Ref RawDataBucket
+      QueueArn: !GetAtt RawCsvQueue.Arn
+      FilterSuffix: ".csv"
+
+Outputs:
+  RawDataBucket:
+    Value: !Ref RawDataBucket
+    Description: "S3 Bucket for raw CSV uploads"
+
+  CleanDataBucket:
+    Value: !Ref CleanDataBucket
+    Description: "S3 Bucket for cleaned CSVs"
+
+  AnalyticsDataBucket:
+    Value: !Ref AnalyticsDataBucket
+    Description: "S3 Bucket for transformed output data"
+
+  GlueScriptsBucket:
+    Value: !Ref GlueScriptsBucket
+    Description: "S3 Bucket where Glue scripts are uploaded"
+
+  GlueJobName:
+    Value: !Ref MyGlueJob
+    Description: "Name of the AWS Glue Job"
+
+  AthenaWorkGroup:
+    Value: !Ref AthenaWorkGroup
+    Description: "Athena workgroup for executing queries"
+
+  AthenaQueryFunction:
+    Value: !Ref RunAthenaQueryFunction
+    Description: "Lambda function to run Athena queries"
